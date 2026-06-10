@@ -1,0 +1,545 @@
+/**
+ * COD Gmail -> Google Drive router.
+ *
+ * Flow:
+ * Gmail unread messages with attachments
+ * -> classify each attachment by sender/subject/body/file content
+ * -> save file to the configured Google Drive market folder:
+ * market / carrier / yyyy / MM / unique_file_name
+ *
+ * Then Google Drive for desktop + PowerShell can copy the whole market tree
+ * to the local network share.
+ */
+
+// 1. CONFIGURATION
+// These IDs should point to the Google Drive folders for each market.
+const FOLDERS = {
+  "allegro.pl": "1EsnmKXOXtfZhKE9xQG8w_5eYPTEhz8tX",
+  "allegro.cz": "1bCvIrmvn5KwQTnn37wCu1CRz9JSaPPjz",
+  "allegro.sk": "1SC-aqAGxlqiz5mO_rZdFwYd_HnP3pzdi",
+  "allegro.hu": "1sHCzijjMBOyZi41jGQuQ4hT7AVJV2wim"
+};
+
+// Mail aliases to monitor. The script searches each alias separately and deduplicates threads.
+const ALIAS_EMAILS = [
+  "ag-fd-cash-reconciliation@allegro.pl",
+  "ag-fd-cash-reconciliation@allegro.com"
+];
+
+// Attachment types that may contain COD reports.
+const ALLOWED_EXTENSIONS = [".CSV", ".XLS", ".XLSX", ".ZIP", ".CCT", ".IMP", ".DUZ", ".PDF"];
+
+// Safety / performance settings.
+const MAX_THREADS_PER_ALIAS_PER_RUN = 30; 
+const MAX_EXECUTION_TIME_MS = 4.5 * 60 * 1000; // 4.5 minuty
+
+// Folder date rule:
+// false = folder year/month is based on processing date, same as your original script.
+// true  = folder year/month is based on the email received date.
+const USE_MESSAGE_DATE_FOR_YEAR_MONTH = false;
+
+/**
+ * Main function for manual run and time-driven trigger.
+ */
+function processCodEmails() {
+  const lock = LockService.getScriptLock();
+
+  if (!lock.tryLock(30000)) {
+    Logger.log("[SKIP] Another processCodEmails run is already active.");
+    return;
+  }
+
+  try {
+    processCodEmailsInternal_();
+  } catch (e) {
+    Logger.log("[FATAL] processCodEmails failed: " + stackOrMessage_(e));
+    throw e;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function processCodEmailsInternal_() {
+  const START_TIME = Date.now();
+  const threads = getThreadsToProcess_();
+  Logger.log("[START] Threads found: " + threads.length);
+
+  for (let t = 0; t < threads.length; t++) {
+    if (Date.now() - START_TIME > MAX_EXECUTION_TIME_MS) {
+      Logger.log("[TIMEOUT] Zbliża się limit czasu 6 minut. Przerywam przetwarzanie w bezpieczny sposób.");
+      break; 
+    }
+
+    const thread = threads[t];
+    try {
+      const messages = thread.getMessages();
+
+      messages.forEach(message => {
+        if (!message.isUnread()) return;
+
+        try {
+          processSingleMessage_(message);
+        } catch (e) {
+          Logger.log("[ERROR] Message processing failed. Message ID: " + safeMessageId_(message) + ". Error: " + stackOrMessage_(e));
+        }
+      });
+    } catch (e) {
+      Logger.log("[ERROR] Thread processing failed. Error: " + stackOrMessage_(e));
+    }
+  }
+
+  Logger.log("[END] Processing finished.");
+}
+
+/**
+ * Search every alias separately.
+ */
+function getThreadsToProcess_() {
+  const byId = {};
+
+  ALIAS_EMAILS.forEach(alias => {
+    const query = "(to:" + alias + " OR deliveredto:" + alias + ") has:attachment is:unread";
+    const found = GmailApp.search(query, 0, MAX_THREADS_PER_ALIAS_PER_RUN);
+    Logger.log("[SEARCH] " + query + " -> " + found.length + " threads");
+
+    found.forEach(thread => {
+      byId[thread.getId()] = thread;
+    });
+  });
+
+  return Object.keys(byId).map(id => byId[id]);
+}
+
+function processSingleMessage_(message) {
+  const sender = String(message.getFrom() || "").toLowerCase();
+  const replyTo = String(message.getReplyTo() || "").toLowerCase();
+  const senderInfo = sender + " " + replyTo;
+
+  const subject = String(message.getSubject() || "");
+  const subjectUpper = subject.toUpperCase();
+
+  const bodyUpper = String(message.getPlainBody() || "").toUpperCase();
+
+  const attachments = message.getAttachments({
+    includeInlineImages: false,
+    includeAttachments: true
+  });
+
+  let allowedAttachmentCount = 0;
+  let savedFileCount = 0;
+  let failedSaveCount = 0;
+  let skippedAllowedCount = 0;
+
+  for (let i = 0; i < attachments.length; i++) {
+    const attachment = attachments[i];
+    const fileName = getBlobName_(attachment);
+
+    if (!isAllowedAttachmentName_(fileName)) {
+      Logger.log("[SKIP] Extension not allowed: " + fileName);
+      continue;
+    }
+
+    allowedAttachmentCount++;
+
+    const result = processAttachment_(attachment, {
+      message: message,
+      senderInfo: senderInfo,
+      subject: subject,
+      subjectUpper: subjectUpper,
+      bodyUpper: bodyUpper,
+      sourceTag: "a" + String(allowedAttachmentCount).padStart(2, "0")
+    });
+
+    savedFileCount += result.savedCount;
+    failedSaveCount += result.failedCount;
+
+    if (result.savedCount === 0) {
+      skippedAllowedCount++;
+    }
+  }
+
+  Logger.log(
+    "[MESSAGE] ID=" + safeMessageId_(message) +
+    ", subject=" + subject +
+    ", allowedAttachments=" + allowedAttachmentCount +
+    ", savedFiles=" + savedFileCount +
+    ", failedSaves=" + failedSaveCount +
+    ", skippedAllowed=" + skippedAllowedCount
+  );
+
+  if (savedFileCount > 0 && failedSaveCount === 0 && skippedAllowedCount === 0) {
+    message.markRead();
+    Logger.log("[READ] All allowed files saved. Message marked as read: " + safeMessageId_(message));
+  } else {
+    Logger.log("[UNREAD] Not all allowed attachments were saved successfully. Message remains unread: " + safeMessageId_(message));
+  }
+}
+
+function processAttachment_(attachment, ctx) {
+  const fileName = getBlobName_(attachment);
+  const fileNameUpper = fileName.toUpperCase();
+
+  let targetMarket = null;
+  let targetCarrier = null;
+  let savedCount = 0;
+  let failedCount = 0;
+
+  const senderInfo = ctx.senderInfo;
+  const subjectUpper = ctx.subjectUpper;
+  const bodyUpper = ctx.bodyUpper;
+
+  // --- POPRAWKA: Szablon cod_summary_report dla DPD HU w HUF (przed innymi regułami DPD) ---
+  if (senderInfo.includes("dpd") && fileNameUpper.includes("COD_SUMMARY_REPORT") && fileNameUpper.endsWith(".CSV")) {
+    targetMarket = "allegro.hu";
+    targetCarrier = "DPD HU";
+  }
+
+  // DPD PL / [AD] DPD PL
+  else if (senderInfo.includes("specyfikacja_cod@dpd.com.pl") || senderInfo.includes("specyfikacja_cod")) {
+    if (subjectUpper.includes("424992")) {
+      targetMarket = "allegro.pl";
+      targetCarrier = "[AD] DPD PL";
+    } else {
+      targetCarrier = "DPD PL";
+      if (subjectUpper.includes("288914") || subjectUpper.includes("314256")) targetMarket = "allegro.pl";
+      else if (subjectUpper.includes("380125")) targetMarket = "allegro.cz";
+      else if (subjectUpper.includes("380126")) targetMarket = "allegro.sk";
+      else if (subjectUpper.includes("399834")) targetMarket = "allegro.hu";
+    }
+  }
+
+  // Poczta Polska
+  else if (senderInfo.includes("tomasz.kruk@poczta-polska.pl") && subjectUpper.includes("POCZTA POLSKA S.A. RAPORT")) {
+    targetMarket = "allegro.pl";
+    targetCarrier = "Poczta Polska";
+  }
+
+  // ONE PL
+  else if (senderInfo.includes("powiadomienia-allegro@opennet.pl") && subjectUpper.includes("ZESTAWIENIE TRANSAKCJI POBRANIOWYCH")) {
+    targetMarket = "allegro.pl";
+    targetCarrier = "ONE PL";
+  }
+
+  // DPD CZ / DPD SK / DPD HU from hromadne.cod@dpd.cz
+  else if (senderInfo.includes("hromadne.cod@dpd.cz")) {
+    if (subjectUpper.includes("T\u00ddDENN\u00cd ROZPIS HROMADN\u00ddCH PLATEB")) {
+      // POPRAWKA: Usunięto niepotrzebne przypisanie do "DPD CZ" dla rynku PL (duplikowało DPD PL)
+      Logger.log("[SKIP] Pomijanie TÝDENNÍ ROZPIS dla allegro.pl (specyfikacje są już w DPD PL).");
+      return { savedCount: 0, failedCount: 0 };
+    } else if (subjectUpper.includes("DENN\u00cd ROZPIS HROMADN\u00ddCH PLATEB")) {
+      targetMarket = "allegro.sk";
+      targetCarrier = "DPD SK"; // NAPRAWIONO: Było "DPD CZ" – powodowało brak folderu i plików DPD SK
+    } else if (subjectUpper.includes("COD SEZNAM - EMAIL") && subjectUpper.includes("EXPORT")) {
+      targetMarket = "allegro.cz";
+      targetCarrier = "DPD SK";
+    } else if (subjectUpper.includes("COD SEZNAM - EMAIL") && subjectUpper.includes("/EUR")) {
+      targetMarket = "allegro.hu";
+      targetCarrier = "DPD HU";
+    } else if (subjectUpper.includes("COD SEZNAM - EMAIL")) {
+      targetMarket = "allegro.cz";
+      targetCarrier = "DPD CZ";
+    }
+  }
+
+  // DPD HU / CZ / SK from register-info@dpd.hu
+  else if (senderInfo.includes("register-info@dpd.hu")) {
+    if (subjectUpper.includes("CZ10300635")) {
+      targetMarket = "allegro.hu";
+      targetCarrier = "DPD CZ";
+    } else if (subjectUpper.includes("EXPORT")) {
+      targetMarket = "allegro.hu";
+      targetCarrier = "DPD SK";
+    } else if (subjectUpper.includes("ALLEGRO SP. Z O.O./EUR - COD \u00d6SSZEVONT RIPORT")) {
+      targetMarket = "allegro.pl";
+      targetCarrier = "DPD HU";
+    }
+  }
+
+  // DPD SK from dobierky@dpd.sk
+  else if (senderInfo.includes("dobierky@dpd.sk") && subjectUpper.includes("PL REPORT ALLEGRO SP. Z O.O.")) {
+    targetMarket = "allegro.pl";
+    targetCarrier = "DPD SK";
+  }
+
+  // DPD SK / HU from noreply@dpd.sk
+  else if (senderInfo.includes("noreply@dpd.sk")) {
+    if (subjectUpper.includes("- HELICAR")) {
+      targetMarket = "allegro.sk";
+      targetCarrier = "DPD SK";
+    } else if (subjectUpper.includes("/EUR")) {
+      targetMarket = "allegro.sk";
+      targetCarrier = "DPD HU";
+    }
+  }
+
+  // DHL
+  else if (senderInfo.includes("pl.no.reply@dhl.com") && subjectUpper.includes("ZWROT POBRANIA")) {
+    targetCarrier = "DHL";
+    if (bodyUpper.includes("CZK")) targetMarket = "allegro.cz";
+    else if (bodyUpper.includes("EUR")) targetMarket = "allegro.sk";
+    else if (bodyUpper.includes("HUF")) targetMarket = "allegro.hu";
+  }
+
+  // PACKETA
+  else if (senderInfo.includes("important@packeta.pl") && subjectUpper.includes("SPECYFIKACJE")) {
+    if (fileNameUpper.endsWith(".ZIP")) {
+      try {
+        const unzippedBlobs = Utilities.unzip(attachment);
+
+        for (let z = 0; z < unzippedBlobs.length; z++) {
+          const extractedBlob = unzippedBlobs[z];
+          const extractedName = getBlobName_(extractedBlob);
+
+          if (extractedName.indexOf("__MACOSX") === 0 || extractedName.indexOf(".DS_Store") >= 0) {
+            continue;
+          }
+
+          const subMarket = detectPacketaMarket_(extractedBlob);
+          if (subMarket) {
+            // Dodano filtrowanie XLS również wewnątrz zipów dla spójności, jeśli zajdzie taka potrzeba
+            const ok = saveToDrive_(extractedBlob, subMarket, "Packeta", ctx.message, ctx.sourceTag + "z" + String(z + 1).padStart(2, "0"));
+            if (ok) savedCount++;
+            else failedCount++;
+          } else {
+            Logger.log("[NO MATCH] Packeta ZIP entry not classified: " + extractedName + " from " + fileName);
+          }
+        }
+      } catch (e) {
+        failedCount++;
+        Logger.log("[ERROR] Packeta ZIP unzip failed: " + fileName + ". Error: " + stackOrMessage_(e));
+      }
+
+      return { savedCount: savedCount, failedCount: failedCount };
+    } else {
+      targetCarrier = "Packeta";
+      targetMarket = detectPacketaMarket_(attachment);
+    }
+  }
+
+  // ex-WeDo / Hybrid ex-WeDo
+  else if (senderInfo.includes("noreply@wedo.cz")) {
+    if (subjectUpper.includes("WEDO HYBRID COD REPORT")) {
+      targetMarket = "allegro.cz";
+      targetCarrier = "Hybryda (ex-WeDo)";
+    } else if (subjectUpper.includes("WEDO COD REPORT")) {
+      targetMarket = "allegro.cz";
+      targetCarrier = "ex-WeDo";
+    } else if (subjectUpper.includes("AUTOMATICKY REPORT DOBIREK")) {
+      targetCarrier = "ex-WeDo";
+      // POPRAWKA: Bezpośrednie przekierowanie na rynek SK, jeśli w nazwie pliku występuje "4FU"
+      if (fileNameUpper.includes("EUR") || fileNameUpper.includes("4FU")) {
+        targetMarket = "allegro.sk";
+      } else if (fileNameUpper.includes("CZK")) {
+        targetMarket = "allegro.cz";
+      } else {
+        if (isTextFile_(fileNameUpper)) {
+          try {
+            const content = attachment.getDataAsString().toUpperCase();
+            if (content.includes("EUR")) targetMarket = "allegro.sk";
+            else if (content.includes("CZK")) targetMarket = "allegro.cz";
+          } catch (e) {
+            Logger.log("[ERROR] Cannot read WeDo file content: " + fileName + ". Error: " + stackOrMessage_(e));
+          }
+        } else {
+          Logger.log("[SKIP] Ex-WeDo binary file cannot be read as string: " + fileName);
+        }
+      }
+    }
+  }
+
+  // Express ONE HU
+  else if (senderInfo.includes("utanvet@expressone.hu") && (subjectUpper.includes("UT\u00c1NV\u00c9T ELSZ\u00c1MOL\u00c1S") || subjectUpper.includes("COD REPORT"))) {
+    targetMarket = "allegro.hu";
+    targetCarrier = "Express ONE HU";
+  }
+
+  if (!targetMarket || !targetCarrier) {
+    Logger.log("[NO MATCH] Attachment not classified: " + fileName + ", subject: " + ctx.subject);
+    return { savedCount: 0, failedCount: 0 };
+  }
+
+  // --- POPRAWKA / FILTR: Odrzucanie śmieciowych raportów XLS dla DPD CZ, SK oraz HU ---
+  if (targetCarrier === "DPD CZ" || targetCarrier === "DPD SK" || targetCarrier === "DPD HU") {
+    const dotIndex = fileNameUpper.lastIndexOf(".");
+    const baseNameUpper = dotIndex > 0 ? fileNameUpper.substring(0, dotIndex) : fileNameUpper;
+
+    // Sprawdzenie rozszerzenia .XLS/.XLSX oraz obecności ciągu "XLS" w środku nazwy bazowej pliku
+    if (baseNameUpper.includes("XLS") || fileNameUpper.endsWith(".XLS") || fileNameUpper.endsWith(".XLSX")) {
+      Logger.log("[SKIP FILTR DPD] Zignorowano błędny/bezwartościowy raport XLS: " + fileName);
+      return { savedCount: 0, failedCount: 0 };
+    }
+  }
+
+  const ok = saveToDrive_(attachment.copyBlob(), targetMarket, targetCarrier, ctx.message, ctx.sourceTag);
+  if (ok) savedCount++;
+  else failedCount++;
+
+  return { savedCount: savedCount, failedCount: failedCount };
+}
+
+/**
+ * Zwraca true jeśli plik jest typowym plikiem tekstowym.
+ */
+function isTextFile_(fileNameUpper) {
+  return fileNameUpper.endsWith(".CSV") || 
+         fileNameUpper.endsWith(".TXT") || 
+         fileNameUpper.endsWith(".CCT") || 
+         fileNameUpper.endsWith(".IMP") || 
+         fileNameUpper.endsWith(".DUZ");
+}
+
+/**
+ * Packeta market detection.
+ */
+function detectPacketaMarket_(blob) {
+  const fileNameUpper = getBlobName_(blob).toUpperCase();
+  
+  if (!isTextFile_(fileNameUpper)) {
+    Logger.log("[SKIP] Plik binarny zignorowany przy detekcji Packeta: " + fileNameUpper);
+    return null;
+  }
+
+  try {
+    const content = blob.getDataAsString();
+    const lines = content.split(/\r?\n/);
+
+    for (let i = 1; i < Math.min(10, lines.length); i++) {
+      if (!lines[i] || lines[i].trim() === "") continue;
+
+      const cols = lines[i].split(";");
+      if (cols.length > 13) {
+        const currencyN = cols[13].replace(/[\'\"]/g, "").toUpperCase().trim();
+        if (currencyN === "CZK") return "allegro.cz";
+        if (currencyN === "EUR") return "allegro.sk";
+        if (currencyN === "HUF") return "allegro.hu";
+      }
+    }
+  } catch (e) {
+    Logger.log("[ERROR] Packeta file read failed: " + getBlobName_(blob) + ". Error: " + stackOrMessage_(e));
+  }
+
+  return null;
+}
+
+/**
+ * Safe creation of a folder tree: market root / carrier / yyyy / MM.
+ */
+function saveToDrive_(blob, targetMarket, targetCarrier, message, sourceTag) {
+  if (!targetMarket || !targetCarrier || !FOLDERS[targetMarket]) {
+    Logger.log("[ERROR] Missing market/carrier/folder mapping. market=" + targetMarket + ", carrier=" + targetCarrier + ", file=" + getBlobName_(blob));
+    return false;
+  }
+
+  try {
+    const marketFolder = DriveApp.getFolderById(FOLDERS[targetMarket]);
+
+    const folderDate = USE_MESSAGE_DATE_FOR_YEAR_MONTH ? message.getDate() : new Date();
+    const yearStr = folderDate.getFullYear().toString();
+    const monthStr = (folderDate.getMonth() + 1).toString().padStart(2, "0");
+
+    const carrierFolder = getOrCreateSubfolder_(marketFolder, targetCarrier);
+    const yearFolder = getOrCreateSubfolder_(carrierFolder, yearStr);
+    const monthFolder = getOrCreateSubfolder_(yearFolder, monthStr);
+
+    const safeName = makeUniqueDriveFileName_(blob, targetMarket, targetCarrier, message, sourceTag);
+
+    const existingFiles = monthFolder.getFilesByName(safeName);
+    if (existingFiles.hasNext()) {
+      Logger.log("[EXISTS] " + safeName + " already exists in " + targetMarket + "/" + targetCarrier + "/" + yearStr + "/" + monthStr);
+      return true;
+    }
+
+    const fileBlob = blob.copyBlob();
+    fileBlob.setName(safeName);
+    monthFolder.createFile(fileBlob);
+
+    Logger.log("[SUCCESS] " + safeName + " -> " + targetMarket + "/" + targetCarrier + "/" + yearStr + "/" + monthStr);
+    return true;
+  } catch (e) {
+    Logger.log("[ERROR] Drive save failed. file=" + getBlobName_(blob) + ", market=" + targetMarket + ", carrier=" + targetCarrier + ", error=" + stackOrMessage_(e));
+    return false;
+  }
+}
+
+function getOrCreateSubfolder_(parentFolder, folderName) {
+  const cleanName = String(folderName || "").trim();
+  if (!cleanName) return parentFolder;
+
+  const folders = parentFolder.getFoldersByName(cleanName);
+  if (folders.hasNext()) {
+    return folders.next();
+  }
+
+  return parentFolder.createFolder(cleanName);
+}
+
+function isAllowedAttachmentName_(fileName) {
+  const upper = String(fileName || "").toUpperCase();
+  return ALLOWED_EXTENSIONS.some(ext => upper.endsWith(ext));
+}
+
+function sanitizeFileName_(name) {
+  let out = String(name || "attachment")
+    .replace(/[\x00-\x1F<>:\"\/\\|?*]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  out = out.replace(/[. ]+$/g, "");
+  return out || "attachment";
+}
+
+function sanitizeToken_(value) {
+  return sanitizeFileName_(value)
+    .replace(/\s+/g, "_")
+    .replace(/_+/g, "_")
+    .substring(0, 60);
+}
+
+function truncateFileName_(fileName, maxLen) {
+  const clean = sanitizeFileName_(fileName);
+  if (clean.length <= maxLen) return clean;
+
+  const dot = clean.lastIndexOf(".");
+  if (dot > 0 && clean.length - dot <= 12) {
+    const ext = clean.substring(dot);
+    return clean.substring(0, maxLen - ext.length) + ext;
+  }
+
+  return clean.substring(0, maxLen);
+}
+
+function makeUniqueDriveFileName_(blob, targetMarket, targetCarrier, message, sourceTag) {
+  const tz = Session.getScriptTimeZone();
+  const msgDate = message && message.getDate ? message.getDate() : new Date();
+  const ts = Utilities.formatDate(msgDate, tz, "yyyyMMdd_HHmmss");
+  const idPart = message && message.getId ? String(message.getId()).substring(0, 12) : Utilities.getUuid().substring(0, 12);
+  const tagPart = sanitizeToken_(sourceTag || "att");
+
+  const marketPart = sanitizeToken_(targetMarket);
+  const carrierPart = sanitizeToken_(targetCarrier);
+  const originalName = truncateFileName_(getBlobName_(blob), 120);
+
+  return sanitizeFileName_(ts + "_" + marketPart + "_" + carrierPart + "_" + idPart + "_" + tagPart + "_" + originalName);
+}
+
+function getBlobName_(blob) {
+  try {
+    const name = blob && blob.getName ? blob.getName() : "";
+    return sanitizeFileName_(name || "attachment");
+  } catch (e) {
+    return "attachment";
+  }
+}
+
+function safeMessageId_(message) {
+  try {
+    return message.getId();
+  } catch (e) {
+    return "unknown";
+  }
+}
+
+function stackOrMessage_(e) {
+  if (!e) return "unknown error";
+  return e.stack || e.message || String(e);
+}
