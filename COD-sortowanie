@@ -223,12 +223,11 @@ function processAttachment_(attachment, ctx) {
   // DPD CZ / DPD SK / DPD HU from hromadne.cod@dpd.cz
   else if (senderInfo.includes("hromadne.cod@dpd.cz")) {
     if (subjectUpper.includes("T\u00ddDENN\u00cd ROZPIS HROMADN\u00ddCH PLATEB")) {
-      // POPRAWKA: Usunięto niepotrzebne przypisanie do "DPD CZ" dla rynku PL (duplikowało DPD PL)
       Logger.log("[SKIP] Pomijanie TÝDENNÍ ROZPIS dla allegro.pl (specyfikacje są już w DPD PL).");
       return { savedCount: 0, failedCount: 0 };
     } else if (subjectUpper.includes("DENN\u00cd ROZPIS HROMADN\u00ddCH PLATEB")) {
-      targetMarket = "allegro.sk";
-      targetCarrier = "DPD SK"; // NAPRAWIONO: Było "DPD CZ" – powodowało brak folderu i plików DPD SK
+      Logger.log("[SKIP] Pomijanie DENNÍ ROZPIS dla allegro.sk (wymagany oficjalny format ze screenów).");
+      return { savedCount: 0, failedCount: 0 };
     } else if (subjectUpper.includes("COD SEZNAM - EMAIL") && subjectUpper.includes("EXPORT")) {
       targetMarket = "allegro.cz";
       targetCarrier = "DPD SK";
@@ -263,12 +262,13 @@ function processAttachment_(attachment, ctx) {
 
   // DPD SK / HU from noreply@dpd.sk
   else if (senderInfo.includes("noreply@dpd.sk")) {
-    if (subjectUpper.includes("- HELICAR")) {
-      targetMarket = "allegro.sk";
-      targetCarrier = "DPD SK";
-    } else if (subjectUpper.includes("/EUR")) {
+    // NAPRAWIONO: Warunek sprawdzający walutę /EUR musi być wyżej, w innym wypadku ogólna fraza "ODPLATENE DOBIERKY..." przechwytywała i błędnie kierowała plik do DPD SK
+    if (subjectUpper.includes("/EUR")) {
       targetMarket = "allegro.sk";
       targetCarrier = "DPD HU";
+    } else if (subjectUpper.includes("ODPLATENE DOBIERKY REPORT ALLEGRO SP. Z O.O.")) {
+      targetMarket = "allegro.sk";
+      targetCarrier = "DPD SK";
     }
   }
 
@@ -296,7 +296,6 @@ function processAttachment_(attachment, ctx) {
 
           const subMarket = detectPacketaMarket_(extractedBlob);
           if (subMarket) {
-            // Dodano filtrowanie XLS również wewnątrz zipów dla spójności, jeśli zajdzie taka potrzeba
             const ok = saveToDrive_(extractedBlob, subMarket, "Packeta", ctx.message, ctx.sourceTag + "z" + String(z + 1).padStart(2, "0"));
             if (ok) savedCount++;
             else failedCount++;
@@ -326,7 +325,6 @@ function processAttachment_(attachment, ctx) {
       targetCarrier = "ex-WeDo";
     } else if (subjectUpper.includes("AUTOMATICKY REPORT DOBIREK")) {
       targetCarrier = "ex-WeDo";
-      // POPRAWKA: Bezpośrednie przekierowanie na rynek SK, jeśli w nazwie pliku występuje "4FU"
       if (fileNameUpper.includes("EUR") || fileNameUpper.includes("4FU")) {
         targetMarket = "allegro.sk";
       } else if (fileNameUpper.includes("CZK")) {
@@ -360,13 +358,21 @@ function processAttachment_(attachment, ctx) {
 
   // --- POPRAWKA / FILTR: Odrzucanie śmieciowych raportów XLS dla DPD CZ, SK oraz HU ---
   if (targetCarrier === "DPD CZ" || targetCarrier === "DPD SK" || targetCarrier === "DPD HU") {
-    const dotIndex = fileNameUpper.lastIndexOf(".");
-    const baseNameUpper = dotIndex > 0 ? fileNameUpper.substring(0, dotIndex) : fileNameUpper;
+    // Definiujemy białą listę (pary market + przewoźnik, dla których NIE BLOKUJEMY plików XLS)
+    const isXlsAllowed = 
+      (targetCarrier === "DPD SK" && targetMarket === "allegro.sk") ||
+      (targetCarrier === "DPD SK" && targetMarket === "allegro.pl") ||
+      (targetCarrier === "DPD HU" && targetMarket === "allegro.sk");
 
-    // Sprawdzenie rozszerzenia .XLS/.XLSX oraz obecności ciągu "XLS" w środku nazwy bazowej pliku
-    if (baseNameUpper.includes("XLS") || fileNameUpper.endsWith(".XLS") || fileNameUpper.endsWith(".XLSX")) {
-      Logger.log("[SKIP FILTR DPD] Zignorowano błędny/bezwartościowy raport XLS: " + fileName);
-      return { savedCount: 0, failedCount: 0 };
+    // Jeśli kombinacja nie znajduje się na białej liście, sprawdzamy rozszerzenie i blokujemy śmieciowe XLS
+    if (!isXlsAllowed) {
+      const dotIndex = fileNameUpper.lastIndexOf(".");
+      const baseNameUpper = dotIndex > 0 ? fileNameUpper.substring(0, dotIndex) : fileNameUpper;
+
+      if (baseNameUpper.includes("XLS") || fileNameUpper.endsWith(".XLS") || fileNameUpper.endsWith(".XLSX")) {
+        Logger.log("[SKIP FILTR DPD] Zignorowano błędny/bezwartościowy raport XLS: " + fileName + " dla marketu: " + targetMarket + " (" + targetCarrier + ")");
+        return { savedCount: 0, failedCount: 0 };
+      }
     }
   }
 
